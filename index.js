@@ -3,6 +3,7 @@ const cors = require("cors");
 const app = express();
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
+const stripe = require("stripe")(process.env.PAYMENT_METHOD_SECRET);
 const port = process.env.PORT || 5000;
 
 // middleware
@@ -16,6 +17,7 @@ const verifyJWT = (req, res, next) => {
   if (!authorization) {
     return res.status(401).send({ error: true, message: "unthorized" });
   }
+
   const token = authorization.split(" ")[1];
   // console.log(token);
   jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
@@ -23,11 +25,13 @@ const verifyJWT = (req, res, next) => {
       return res.status(401).send({ error: true, message: "unthorized" });
     }
     req.decoded = decoded;
+    2;
     next();
   });
 };
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const { default: Stripe } = require("stripe");
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.et32bhj.mongodb.net/?retryWrites=true&w=majority`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -42,12 +46,13 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
 
     const usersCollection = client.db("bistroDB").collection("users");
     const menuCollection = client.db("bistroDB").collection("menu");
     const reviewsCollection = client.db("bistroDB").collection("reviews");
     const cartCollection = client.db("bistroDB").collection("carts");
+    const paymentCollection = client.db("bistroDB").collection("payments");
 
     // jwt
     app.post("/jwt", (req, res) => {
@@ -125,6 +130,18 @@ async function run() {
       res.send(result);
     });
 
+    app.post("/menu", verifyJWT, verifyAdmin, async (req, res) => {
+      const item = req.body;
+      const result = await menuCollection.insertOne(item);
+      res.send(result);
+    });
+    app.delete("/menu/:id", verifyJWT, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await menuCollection.deleteOne(query);
+      res.send(result);
+    });
+
     // review collection
     app.get("/reviews", async (req, res) => {
       const result = await reviewsCollection.find().toArray();
@@ -164,6 +181,68 @@ async function run() {
       const query = { _id: new ObjectId(id) };
       const result = await cartCollection.deleteOne(query);
       res.send(result);
+    });
+
+    // payment intent
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      // console.log(price, amount);
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+
+    // payment relatd api
+    app.post("/payments", verifyJWT, async (req, res) => {
+      const payment = req.body;
+      const inserResult = await paymentCollection.insertOne(payment);
+      const query = {
+        _id: { $in: payment.cartItems.map((id) => new ObjectId(id)) },
+      };
+      const deleteResult = await cartCollection.deleteMany(query);
+      res.send({ inserResult, deleteResult });
+    });
+
+    // statts related api
+    app.get("/admin-stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const users = await usersCollection.estimatedDocumentCount();
+      const products = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+      // const revenue = await paymentCollection
+      //   .aggregate([
+      //     {
+      //       $group: {
+      //         _id: null,
+      //         total: { $sum: "$price" },
+      //       },
+      //     },
+      //   ])
+      //   .toArray();
+
+      const payments = await paymentCollection.find().toArray();
+      const revenue = payments.reduce((total, payment) => {
+        return total + payment.price;
+      }, 0);
+      res.send({ users, products, orders, revenue });
+    });
+
+    app.get("/order-stats", async (req, res) => {
+      const payments = await paymentCollection.find().toArray();
+      const menuItems = payments.map((payment) => payment.manuItems);
+      const query = { _id: { $in: menuItems.flat() } };
+      const menu = await menuCollection.find(query).toArray();
+      const populars = menu.filter((populer) => populer.category === "popular");
+      const pizzas = menu.filter((dessert) => dessert.category === "dessert");
+      const salads = menu.filter((salad) => salad.category === "salad");
+      const soups = menu.filter((soup) => soup.category === "soup");
+      const drinks = menu.filter((drink) => drink.category === "drinks");
+      res.send({ populars, pizzas, salads, soups, drinks });
     });
 
     // Send a ping to confirm a successful connection
